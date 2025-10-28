@@ -197,5 +197,125 @@ def load_single_embeddings(data_paths, temporal_len, spatial_points, device, dev
 
     return embeddings
 
+
+def fine_tune_via_recovery(
+        task_name, dataset, fine_tuner, regression_head, recovery_head, tokenizer, device, temporal_len, spatial_points,
+        config, selected_regions, input_len
+):
+    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
+
+    if isinstance(regression_head, nn.DataParallel):
+        regression_head_actual = regression_head.module
+    else:
+        regression_head_actual = regression_head
+
+    if isinstance(recovery_head, nn.DataParallel):
+        recovery_head_actual = recovery_head.module
+    else:
+        recovery_head_actual = recovery_head
+
+    # Define model paths (please update accordingly)
+    fine_tuner_path = config.get("fine_tuner_path", None)
+    regression_head_path = config.get("regression_head_path", None)
+    recovery_path = config.get("recovery_path", None)
+
+    if fine_tuner_path and os.path.exists(fine_tuner_path):
+        fine_tuner.load_state_dict(torch.load(fine_tuner_path))
+        print(f"Loaded Fine-Tuner weights from {fine_tuner_path}")
+    else:
+        print("Fine-Tuner weights not found or path not set. Using initialized weights.")
+
+    if regression_head_path and os.path.exists(regression_head_path):
+        load_model_state(regression_head_actual, regression_head_path)
+        print(f"Loaded RegressionHead weights from {regression_head_path}")
+    else:
+        print("RegressionHead weights not found or path not set. Using initialized weights.")
+
+    if recovery_path and os.path.exists(recovery_path):
+        state_dict = torch.load(recovery_path)
+        recovery_head_actual.conv3.load_state_dict(state_dict["conv3"])
+        recovery_head_actual.conv4.load_state_dict(state_dict["conv4"])
+        recovery_head_actual.output_fc.load_state_dict(state_dict["output_fc"])
+        print(f"Loaded RecoveryHead non-shared layers from {recovery_path}")
+    else:
+        print("RecoveryHead weights not found or path not set. Using initialized weights.")
+
+    for param in regression_head_actual.conv3.parameters():
+        param.requires_grad = False
+    for param in regression_head_actual.conv4.parameters():
+        param.requires_grad = False
+    for param in regression_head_actual.fc.parameters():
+        param.requires_grad = False
+
+    for param in regression_head_actual.conv1.parameters():
+        param.requires_grad = True
+    for param in regression_head_actual.conv2.parameters():
+        param.requires_grad = True
+    for param in regression_head_actual.self_attention.parameters():
+        param.requires_grad = True
+
+    for param in recovery_head_actual.parameters():
+        param.requires_grad = True
+
+    optimizer = optim.Adam(
+        list(recovery_head_actual.parameters()),
+        lr=config["learning_rate"]
+    )
+
+    recovery_criterion = nn.MSELoss()
+
+    for epoch in range(config["fine_tune_epochs"]):
+        fine_tuner.eval()
+        recovery_head.train()
+        total_loss = 0
+        start_time = time.time()
+
+        for batch in dataloader:
+            embeddings = batch["embedding"].to(device)
+            optimizer.zero_grad()
+
+            for region in selected_regions:
+                input_embeds = embeddings[:, :input_len, region, :]
+                instruction = (
+                    f"Given the historical {input_len} hours data: <start> <end> "
+                    f"in traffic {task_name}, predict the next {config['target_length']} hours."
+                )
+                tokenized_instruction = tokenizer(
+                    instruction,
+                    return_tensors="pt",
+                    max_length=config["max_instruction_length"],
+                    truncation=True,
+                    padding="max_length",
+                ).to(device)
+
+                inputs_embeds, updated_attention_mask = embed_into_instruction_dynamic(
+                    tokenized_instruction, input_embeds, fine_tuner, tokenizer, device
+                )
+
+                with torch.no_grad():
+                    llm_output = fine_tuner(inputs_embeds, updated_attention_mask)
+
+                masked_llm_output, mask = apply_mask(llm_output, mask_ratio=0.1)
+                recovered_embeds = recovery_head(masked_llm_output)
+                masked_loss = recovery_criterion(recovered_embeds[mask], llm_output[mask])
+                total_batch_loss = masked_loss
+                total_batch_loss.backward()
+                total_loss += total_batch_loss.item()
+
+            optimizer.step()
+
+        end_time = time.time()
+        print(
+            f"Task: {task_name}, Epoch {epoch + 1}/{config['fine_tune_epochs']}, Time: {end_time - start_time:.2f}s, "
+            f"Recovery Loss: {total_loss / len(dataloader):.6f}"
+            f"Samples: {len(dataloader.dataset)}"
+        )
+
+        if (epoch + 1) % 50 == 0:
+            target_len = config["target_length"]
+            save_path = f"./modelx/{task_name}_regression_head_finetuned_target_{target_len}_t{temporal_len}_s{spatial_points}_epoch_{epoch + 1}.pt"
+            torch.save(regression_head_actual.state_dict(), save_path)
+            print(f"Saved updated Regression Head to {save_path}")
+
 if __name__ == "__main__":
     main()
