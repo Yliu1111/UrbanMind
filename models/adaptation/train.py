@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -42,6 +44,8 @@ def main():
     temporal_len = 2
     spatial_points = 50
     input_len = 4
+    # located test regions in embedding
+    selected_regions = random.sample(range(37, 50), k=5)
     config = {
         "fine_tune_epochs": 50,
         "target_length": 3,
@@ -108,6 +112,20 @@ def main():
             input_len = input_len,
         )
 
+        evaluate_task(
+                    task_name=task,
+                    dataset=task_dataset,
+                    fine_tuner=fine_tuner,
+                    regression_head=regression_head,
+                    tokenizer=tokenizer,
+                    device=device,
+                    temporal_len=temporal_len,
+                    spatial_points=spatial_points,
+                    config=config,
+                    selected_regions = selected_regions,
+                    input_len = input_len,
+                )
+
 
 
 def load_multifaced_embeddings(data_paths, temporal_len, spatial_points, device, device_ids):
@@ -119,9 +137,9 @@ def load_multifaced_embeddings(data_paths, temporal_len, spatial_points, device,
     speed, demand, inflow = process_d(speed, demand, inflow)
 
     # Reshape data to match the embedding dimensions
-    speed = speed.reshape(-1, 12, 63, 10, 10)[:, :, :50, :, :]
-    inflow = inflow.reshape(-1, 12, 63, 10, 10)[:, :, :50, :, :]
-    demand = demand.reshape(-1, 12, 63, 10, 10)[:, :, :50, :, :]
+    speed = speed.reshape(-1, 12, 63, 10, 10)[:, :, -50:, :, :]
+    inflow = inflow.reshape(-1, 12, 63, 10, 10)[:, :, -50:, :, :]
+    demand = demand.reshape(-1, 12, 63, 10, 10)[:, :, -50:, :, :]
     batch_data = torch.stack([speed, inflow, demand], dim=3)
     batch_data_out = torch.stack([speed, inflow, demand], dim=3)
 
@@ -159,9 +177,9 @@ def load_single_embeddings(data_paths, temporal_len, spatial_points, device, dev
     speed, demand, inflow = process_d(speed, demand, inflow)
 
     # Reshape data to match the embedding dimensions
-    speed = speed.reshape(-1, 12, 63, 10, 10)[:, :, :50, :, :]
-    inflow = inflow.reshape(-1, 12, 63, 10, 10)[:, :, :50, :, :]
-    demand = demand.reshape(-1, 12, 63, 10, 10)[:, :, :50, :, :]
+    speed = speed.reshape(-1, 12, 63, 10, 10)[:, :, -50:, :, :]
+    inflow = inflow.reshape(-1, 12, 63, 10, 10)[:, :, -50:, :, :]
+    demand = demand.reshape(-1, 12, 63, 10, 10)[:, :, -50:, :, :]
     batch_data = torch.stack([speed, inflow, demand], dim=3)
 
     dataset = MyDataset(batch_data)
@@ -316,6 +334,131 @@ def fine_tune_via_recovery(
             save_path = f"./modelx/{task_name}_regression_head_finetuned_target_{target_len}_t{temporal_len}_s{spatial_points}_epoch_{epoch + 1}.pt"
             torch.save(regression_head_actual.state_dict(), save_path)
             print(f"Saved updated Regression Head to {save_path}")
+
+
+
+def calculate_mae(y_true, y_pred):
+    if not isinstance(y_true, torch.Tensor):
+        y_true = torch.tensor(y_true)
+    if not isinstance(y_pred, torch.Tensor):
+        y_pred = torch.tensor(y_pred)
+
+    abs_error = torch.abs(y_true - y_pred)
+    mae = abs_error.mean()
+    return mae.item()
+
+
+def calculate_rmse(y_true, y_pred):
+    if isinstance(y_true, np.ndarray):
+        y_true = torch.tensor(y_true)
+    if isinstance(y_pred, np.ndarray):
+        y_pred = torch.tensor(y_pred)
+
+    return torch.sqrt(torch.mean((y_true - y_pred) ** 2)).item()
+
+
+
+def evaluate_task(
+        task_name, dataset, fine_tuner, regression_head, tokenizer, device, temporal_len, spatial_points, config,
+        selected_regions, input_len
+):
+    fine_tuner_path = f"../llama_finetune/modelx/{task_name}_fine_tuner_target_{config['target_length']}_attn_t{temporal_len}_s{spatial_points}_epoch_100.pt"
+
+    if os.path.exists(fine_tuner_path):
+        fine_tuner.load_state_dict(torch.load(fine_tuner_path))
+        print(f"Loaded Fine-Tuner weights from {fine_tuner_path}")
+    else:
+        print(f"Fine-Tuner weights not found at {fine_tuner_path}. Using initialized weights.")
+
+    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False)
+    fine_tuner.eval()
+
+    all_results = {}
+
+    for epoch in range(50, config["fine_tune_epochs"] + 1, 50):
+        if isinstance(regression_head, nn.DataParallel):
+            regression_head_actual = regression_head.module
+        else:
+            regression_head_actual = regression_head
+
+        regression_head_path = f"./modelx/{task_name}_regression_head_finetuned_target_{config['target_length']}_t{temporal_len}_s{spatial_points}_epoch_{epoch}.pt"
+
+        if os.path.exists(regression_head_path):
+            regression_head_actual.load_state_dict(torch.load(regression_head_path))
+            regression_head_actual.eval()
+            print(f"Loaded updated Regression Head from {regression_head_path}")
+        else:
+            print(f"Regression Head weights not found at {regression_head_path}. Skipping epoch {epoch}.")
+            continue
+
+        all_predictions = []
+        all_targets = []
+
+        start_time = time.time()
+        with torch.no_grad():
+            for batch in dataloader:
+                embeddings = batch["embedding"].to(device)
+                raw_data = batch["raw_data"].to(device)
+
+                for region in selected_regions:
+                    input_embeds = embeddings[:, :input_len, region, :]
+                    target = raw_data[:, -config["target_length"]:, region, :, :].cpu().numpy()
+
+                    instruction = (
+                        f"Given the historical {input_len} hours data: <start> <end> "
+                        f"in traffic {task_name}, predict the next {config['target_length']} hours."
+                    )
+                    tokenized_instruction = tokenizer(
+                        instruction,
+                        return_tensors="pt",
+                        max_length=config["max_instruction_length"],
+                        truncation=True,
+                        padding="max_length",
+                    ).to(device)
+
+                    inputs_embeds, updated_attention_mask = embed_into_instruction_dynamic(
+                        tokenized_instruction, input_embeds, fine_tuner, tokenizer, device
+                    )
+
+                    llm_output = fine_tuner(inputs_embeds, updated_attention_mask)
+
+                    prediction = regression_head(llm_output, config["target_length"])
+                    all_predictions.append(prediction.cpu().numpy())
+                    all_targets.append(target)
+
+        end_time = time.time()
+
+        all_predictions = np.concatenate(all_predictions, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+
+        absolute_error = np.abs(all_targets - all_predictions)
+        mae_manual = np.mean(absolute_error)
+        print(f"Manual MAE for {task_name}: {mae_manual}")
+
+        print("Predictions shape:", all_predictions.shape)
+        print("Predictions mean value:", all_predictions.mean())
+        print("Targets shape:", all_targets.shape)
+        print("Targets mean value:", all_targets.mean())
+
+        mae = calculate_mae(all_targets, all_predictions)
+        rmse = calculate_rmse(all_targets, all_predictions)
+
+        num_samples = len(dataloader)
+
+        all_results[epoch] = {
+            "MAE": mae,
+            "RMSE": rmse
+        }
+
+        print(f"Evaluation Results for {task_name} at Epoch {epoch}:")
+        print(f"MAE: {mae:.4f}")
+        print(f"RMSE: {rmse:.4f}")
+        print(f"Predicted {num_samples} samples at ave {(end_time - start_time)}s")
+
+    return all_results
+
+
+
 
 if __name__ == "__main__":
     main()
